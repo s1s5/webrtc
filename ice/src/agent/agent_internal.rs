@@ -81,6 +81,9 @@ pub struct AgentInternal {
     pub(crate) keepalive_interval: Duration,
     // How often should we run our internal taskLoop to check for state changes when connecting
     pub(crate) check_interval: Duration,
+
+    need_control: Mutex<u32>,
+    order_control: Mutex<Vec<Message>>,
 }
 
 impl AgentInternal {
@@ -157,6 +160,9 @@ impl AgentInternal {
 
             // AgentConn
             agent_conn: Arc::new(AgentConn::new()),
+
+            need_control: Mutex::new(0),
+            order_control: Mutex::new(Vec::new()),
         };
 
         let chan_receivers = ChanReceivers {
@@ -1174,7 +1180,51 @@ impl AgentInternal {
                     err
                 );
             } else {
-                self.handle_inbound(&mut m, c, src_addr).await;
+                let mut nc = self.need_control.lock().await;
+                match *nc {
+                    0 => {
+                        if m.typ.method == METHOD_BINDING && m.typ.class == CLASS_REQUEST {
+                            self.handle_inbound(&mut m, c, src_addr).await;
+                            *nc += 1;
+
+                            let mut x = self.order_control.lock().await;
+                            for m in x.iter() {
+                                let mut m = m.clone();
+                                self.handle_inbound(&mut m, c, src_addr).await;
+                                *nc += 1;
+                            }
+                            x.clear();
+                        } else if m.typ.method == METHOD_BINDING
+                            && m.typ.class == CLASS_SUCCESS_RESPONSE
+                        {
+                            let mut x = self.order_control.lock().await;
+                            x.push(m);
+                        } else {
+                            self.handle_inbound(&mut m, c, src_addr).await;
+                        }
+                    }
+                    1 => {
+                        if m.typ.method == METHOD_BINDING && m.typ.class == CLASS_REQUEST {
+                            let mut x = self.order_control.lock().await;
+                            x.push(m);
+                        } else if m.typ.method == METHOD_BINDING
+                            && m.typ.class == CLASS_SUCCESS_RESPONSE
+                        {
+                            self.handle_inbound(&mut m, c, src_addr).await;
+                            let mut x = self.order_control.lock().await;
+                            for m in x.iter() {
+                                let mut m = m.clone();
+                                self.handle_inbound(&mut m, c, src_addr).await;
+                            }
+                            x.clear();
+                        } else {
+                            self.handle_inbound(&mut m, c, src_addr).await;
+                        }
+                    }
+                    _ => {
+                        self.handle_inbound(&mut m, c, src_addr).await;
+                    }
+                }
             }
         } else if !self.validate_non_stun_traffic(c, src_addr).await {
             log::warn!(
